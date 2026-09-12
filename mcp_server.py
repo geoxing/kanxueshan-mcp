@@ -6,12 +6,18 @@
 - query_peaks: 按坐标查周边雪山预报
 - forecast_peak: 某山峰未来 N 天金山预报
 """
-import os, json, urllib.request, urllib.parse, datetime
+import os, json, time, urllib.request, urllib.parse, datetime, functools, inspect
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 API = os.environ.get("KXS_API", "http://127.0.0.1:3000")
+
+# 工具调用日志（可选）：设置 KXS_TOOL_LOG=路径 后，每次 tools/call 追加一行 JSONL。
+# 供站点统计页显示「真实使用量」——MCP 端点日志只能看到 HTTP 请求（握手/探测占大头），
+# 后端 API 计数又会被 forecast_peak 这类 1 次调用放大成 8 次请求，都不等于调用次数。
+# 不设该变量则完全不写盘（公开仓库默认关闭）。
+TOOL_LOG = os.environ.get("KXS_TOOL_LOG", "")
 # HOST 默认 0.0.0.0（本地开发需局域网访问）；生产 HOST=127.0.0.1 仅回环，nginx 反代 https://www.yilong.art/mcp
 # transport_security：放行生产域名的 Host/Origin（否则 SDK 的 DNS rebinding 保护会拒经 nginx 的请求）
 mcp = FastMCP(
@@ -29,6 +35,61 @@ def get(path):
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())
 
+def _client_ip(ctx):
+    """经 nginx 反代时真实来源 IP 在 X-Real-IP；直连回退到 socket 对端。"""
+    try:
+        req = ctx.request_context.request
+    except Exception:
+        return "-"
+    if req is None:
+        return "-"
+    h = getattr(req, "headers", None) or {}
+    ip = (h.get("x-real-ip")
+          or (h.get("x-forwarded-for") or "").split(",")[0].strip())
+    if not ip and getattr(req, "client", None):
+        ip = req.client.host
+    return ip or "-"
+
+def _write_log(rec):
+    # 日志是旁路：任何失败（磁盘满/无权限）都不能影响工具返回
+    try:
+        with open(TOOL_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def _logged(fn):
+    """记录每次 tools/call：工具名、参数、来源 IP、耗时、成败。未设 TOOL_LOG 时零开销。"""
+    if not TOOL_LOG:
+        return fn
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        t0 = time.time()
+        ok = True
+        try:
+            return fn(*a, **kw)
+        except Exception:
+            ok = False
+            raise
+        finally:
+            try:
+                bound = sig.bind(*a, **kw)
+                args = {k: (v[:60] if isinstance(v, str) else v)
+                        for k, v in bound.arguments.items() if k != "ctx"}
+                _write_log({
+                    "t": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "tool": fn.__name__,
+                    "args": args,
+                    "ip": _client_ip(kw.get("ctx") or bound.arguments.get("ctx")),
+                    "ms": round((time.time() - t0) * 1000),
+                    "ok": ok,
+                })
+            except Exception:
+                pass
+    return wrapper
+
 def _fmt_peak(p):
     m, e = p.get("golden_morning"), p.get("golden_evening")
     f = p.get("visibility_factors") or {}
@@ -42,7 +103,8 @@ def _fmt_peak(p):
     return "\n".join(lines)
 
 @mcp.tool()
-def search_peak(name: str) -> str:
+@_logged
+def search_peak(name: str, ctx: Context) -> str:
     """搜索中国雪山，返回匹配的山峰及其观景点（子梅垭口、飞来寺、台怀镇等）。
     参数 name: 山峰名关键词（贡嘎山、幺妹峰、卡瓦格博、慕士塔格等）。"""
     matches = get(f"/api/search?q={urllib.parse.quote(name)}").get("matches", [])
@@ -55,7 +117,8 @@ def search_peak(name: str) -> str:
     return "\n".join(out)
 
 @mcp.tool()
-def query_peaks(lat: float, lng: float, date: str = "") -> str:
+@_logged
+def query_peaks(lat: float, lng: float, ctx: Context, date: str = "") -> str:
     """按经纬度查询周边可见雪山及今日日照金山预报（金光时段、0-100 评分、天气因子）。
     参数 lat/lng: WGS-84 十进制度坐标；date: YYYY-MM-DD，缺省今天。"""
     d = date or datetime.date.today().strftime("%Y-%m-%d")
@@ -69,7 +132,9 @@ def query_peaks(lat: float, lng: float, date: str = "") -> str:
     return "\n\n".join(out)
 
 @mcp.tool()
-def forecast_peak(peak: str, days: int = 7, viewpoint: str = "", date: str = "") -> str:
+@_logged
+def forecast_peak(peak: str, ctx: Context, days: int = 7,
+                  viewpoint: str = "", date: str = "") -> str:
     """查询某山峰未来 N 天（1-7）的日照金山预报。
     参数 peak: 山峰名；days: 预报天数；viewpoint: 观景点名（可选，如子梅垭口）；
     date: 起始日期 YYYY-MM-DD，缺省今天。"""

@@ -63,7 +63,8 @@ pip install -r requirements.txt
 KXS_API=http://127.0.0.1:3000 python3 mcp_server.py   # 默认监听 0.0.0.0:3999
 ```
 
-环境变量：`KXS_API`（后端地址）· `HOST` / `PORT`（监听，生产建议 `HOST=127.0.0.1` 走反代）。
+环境变量：`KXS_API`（后端地址）· `HOST` / `PORT`（监听，生产建议 `HOST=127.0.0.1` 走反代）·
+`KXS_TOOL_LOG`（可选，设为文件路径则每次工具调用追加一行 JSONL：工具名/参数/来源 IP/耗时/成败，便于自建用量统计；不设则完全不写盘）。
 
 ---
 
