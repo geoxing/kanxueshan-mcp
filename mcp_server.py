@@ -6,18 +6,28 @@
 - query_peaks: 按坐标查周边雪山预报
 - forecast_peak: 某山峰未来 N 天金山预报
 """
-import os, json, time, urllib.request, urllib.parse, datetime, functools, inspect
+import os, json, time, sqlite3, urllib.request, urllib.parse, datetime, functools, inspect
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 API = os.environ.get("KXS_API", "http://127.0.0.1:3000")
 
-# 工具调用日志（可选）：设置 KXS_TOOL_LOG=路径 后，每次 tools/call 追加一行 JSONL。
-# 供站点统计页显示「真实使用量」——MCP 端点日志只能看到 HTTP 请求（握手/探测占大头），
-# 后端 API 计数又会被 forecast_peak 这类 1 次调用放大成 8 次请求，都不等于调用次数。
-# 不设该变量则完全不写盘（公开仓库默认关闭）。
+# 工具调用日志（可选），两个 sink 各自独立、都可不开：
+#   KXS_TOOL_LOG=路径  每次 tools/call 追加一行 JSONL（便于 tail/调试，公开契约）
+#   KXS_STATS_DB=路径  同一次调用写一行到该 SQLite 的 toolcall 表（站点统计页读它）
+# 不开则零开销、完全不写盘。工具调用数是唯一能反映「真实使用量」的口径——
+# MCP 端点日志只能看到 HTTP 请求（握手/探测占大头），后端 API 计数又会被
+# forecast_peak 这类 1 次调用放大成 8 次请求，都不等于调用次数。
 TOOL_LOG = os.environ.get("KXS_TOOL_LOG", "")
+STATS_DB = os.environ.get("KXS_STATS_DB", "")
+# toolcall 表结构在 web/server.py 的 _DB_SCHEMA 有一份必须保持一致的副本
+_DB_STMT = (
+    "CREATE TABLE IF NOT EXISTS toolcall ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, t TEXT NOT NULL, tool TEXT NOT NULL,"
+    "ip TEXT, ms INTEGER, ok INTEGER, args TEXT)",
+    "CREATE INDEX IF NOT EXISTS idx_toolcall_t ON toolcall(t)",
+)
 # HOST 默认 0.0.0.0（本地开发需局域网访问）；生产 HOST=127.0.0.1 仅回环，nginx 反代 https://www.yilong.art/mcp
 # transport_security：放行生产域名的 Host/Origin（否则 SDK 的 DNS rebinding 保护会拒经 nginx 的请求）
 mcp = FastMCP(
@@ -58,9 +68,31 @@ def _write_log(rec):
     except Exception:
         pass
 
+def _write_db(rec):
+    # 同上，旁路；每次都新开连接：调用频率很低，省得处理跨线程复用
+    try:
+        d = os.path.dirname(STATS_DB)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        conn = sqlite3.connect(STATS_DB, timeout=15)
+        try:
+            conn.execute("PRAGMA busy_timeout=15000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            for stmt in _DB_STMT:
+                conn.execute(stmt)
+            conn.execute("INSERT INTO toolcall (t, tool, ip, ms, ok, args) VALUES (?,?,?,?,?,?)",
+                         (rec["t"], rec["tool"], rec.get("ip"), rec.get("ms"),
+                          1 if rec.get("ok") else 0,
+                          json.dumps(rec.get("args") or {}, ensure_ascii=False)))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
 def _logged(fn):
-    """记录每次 tools/call：工具名、参数、来源 IP、耗时、成败。未设 TOOL_LOG 时零开销。"""
-    if not TOOL_LOG:
+    """记录每次 tools/call：工具名、参数、来源 IP、耗时、成败。两个 sink 都没设时零开销。"""
+    if not TOOL_LOG and not STATS_DB:
         return fn
     sig = inspect.signature(fn)
 
@@ -78,14 +110,18 @@ def _logged(fn):
                 bound = sig.bind(*a, **kw)
                 args = {k: (v[:60] if isinstance(v, str) else v)
                         for k, v in bound.arguments.items() if k != "ctx"}
-                _write_log({
+                rec = {
                     "t": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "tool": fn.__name__,
                     "args": args,
                     "ip": _client_ip(kw.get("ctx") or bound.arguments.get("ctx")),
                     "ms": round((time.time() - t0) * 1000),
                     "ok": ok,
-                })
+                }
+                if TOOL_LOG:
+                    _write_log(rec)
+                if STATS_DB:
+                    _write_db(rec)
             except Exception:
                 pass
     return wrapper
