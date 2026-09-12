@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.geoxing/kanxueshan",
   "title": "看雪山 Kanxueshan",
-  "description": "日照金山预报：查中国雪山未来 7 天的日出/日落金光时段、可见度评分与天气因子。Golden-hour visibility forecasts for snow mountains in China.",
+  "description": "日照金山预报：中国雪山 7 天内的日出/日落金光时段与可见度评分。Golden-hour forecasts for snow mountains in China.",
   "version": "1.0.0",
   "websiteUrl": "https://www.yilong.art/ai.html",
   "repository": {
